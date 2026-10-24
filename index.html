@@ -94,6 +94,19 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   background:#2b3441;color:#fff;padding:10px 16px;border-radius:999px;font-size:13.5px;opacity:0;pointer-events:none;
   transition:.25s;z-index:60;max-width:88vw;text-align:center}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.ai-out{margin:9px 0 0 35px;background:var(--bg3);border:1px solid var(--line);border-radius:10px;
+  padding:10px 11px;font-size:13.5px;line-height:1.7;white-space:pre-wrap;word-break:break-word;color:var(--fg)}
+.ai-out .hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;
+  font-size:12px;color:var(--fg2);letter-spacing:.4px}
+.ai-out .hd button{background:none;border:none;color:var(--fg2);font-size:15px;cursor:pointer;padding:0 2px}
+.ai-out.busy{color:var(--fg2)}
+.btn.ai{color:var(--accent);border-color:rgba(78,161,255,.35)}
+.btn.ai[disabled]{opacity:.4}
+.keyrow{display:flex;gap:8px;align-items:center;margin-top:8px}
+.keyrow input{flex:1;font-size:13px}
+#gemStatus{font-size:12px;color:var(--fg2);margin-top:6px;min-height:16px}
+#gemStatus.ok{color:var(--ok)}
+#gemStatus.err{color:var(--err)}
 .hide{display:none!important}
 @media(max-width:400px){ .en{font-size:17px} }
 </style>
@@ -128,6 +141,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         <button class="btn primary" id="btnGo" style="flex:1">產生聽句 →</button>
       </div>
       <div class="hint" id="goHint">貼上文章後按「產生聽句」，會自動分句、翻成中文，並可逐句朗讀、聽寫。</div>
+      <div class="hint">翻譯不用錢、不用 key。想加 AI 句子解析／意群／單字講解，到右上齒輪填你自己的 Google Gemini key（免費申請，只存在你這台裝置）。</div>
     </section>
 
     <section id="histWrap" class="hide">
@@ -186,6 +200,24 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     <div class="set-row">
       <div><div class="k">自動模糊原文</div><div class="v">進入練習頁先遮住英文，練閱讀</div></div>
       <select id="autoBlur"><option value="0">關</option><option value="1">開</option></select>
+    </div>
+    <div class="set-row" style="display:block">
+      <div><div class="k">AI 解析（Google Gemini）</div>
+        <div class="v">你自己申請的 API key，只存在這台裝置的瀏覽器，不上傳、不寫進程式</div></div>
+      <div class="keyrow">
+        <input type="password" id="gemKey" placeholder="貼上 Gemini API key（AIza…）" autocomplete="off" spellcheck="false">
+        <button class="btn sm" id="gemSave">儲存</button>
+        <button class="btn sm" id="gemTest">測試</button>
+      </div>
+      <div id="gemStatus"></div>
+      <div class="keyrow">
+        <select id="gemModel" style="flex:1"><option value="">（先按「測試」取得可用模型）</option></select>
+      </div>
+      <div class="keyrow">
+        <button class="btn sm ghost" id="gemClear" style="border-color:var(--err);color:var(--err)">刪除 key</button>
+        <button class="btn sm ghost" id="gemWarm">清 AI 快取</button>
+      </div>
+      <div class="v" style="margin-top:8px">免費申請：aistudio.google.com → Get API key。額度用完會顯示 429，換一組或等隔天。</div>
     </div>
     <div class="set-row">
       <div><div class="k">清空本機紀錄</div><div class="v" id="storeInfo">—</div></div>
@@ -284,6 +316,108 @@ async function translateAll(items, tl, onProgress){
   });
   await Promise.all(workers);
   return fail;
+}
+
+/* ---------- Gemini AI（使用者自備 key） ---------- */
+const GEMM = {
+  BASE: 'https://generativelanguage.googleapis.com/v1beta',
+  get key(){ return LS.get('gemKey','') || ''; },
+  set key(v){ LS.set('gemKey', v||''); },
+  get model(){ return LS.get('gemModel','') || ''; },
+  set model(v){ LS.set('gemModel', v||''); },
+  get cacheOn(){ return LS.get('gemCache', true); },
+  cacheKey(kind, text){ return 'gemc_'+kind+'_'+hashStr(text+'|'+this.model); },
+  cached(kind, text){ if(!this.cacheOn) return null; return LS.get(this.cacheKey(kind,text), null); },
+  put(kind, text, out){ if(this.cacheOn) LS.set(this.cacheKey(kind,text), out); },
+  clearCache(){
+    const ks=[]; for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); if(k && k.indexOf('tj_gemc_')===0) ks.push(k); }
+    ks.forEach(k=>localStorage.removeItem(k)); return ks.length;
+  },
+  async listModels(){
+    const r = await fetch(this.BASE + '/models?key=' + encodeURIComponent(this.key));
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(errText(r.status, j));
+    const list = (j.models||[]).filter(m=>{
+      const ms = m.supportedGenerationMethods||[];
+      return ms.indexOf('generateContent')>=0 && /gemini/i.test(m.name||'');
+    }).map(m=>String(m.name).replace(/^models\//,''));
+    // 偏好 flash（便宜快）
+    list.sort((a,b)=>{
+      const rank = n=> /flash/i.test(n)?0 : /flash-lite/i.test(n)?1 : /pro/i.test(n)?2 : 3;
+      return rank(a)-rank(b) || a.localeCompare(b);
+    });
+    return list;
+  },
+  async ask(prompt){
+    if(!this.key) throw new Error('NO_KEY');
+    if(!this.model) throw new Error('NO_MODEL');
+    const body = {
+      contents: [{ role:'user', parts:[{ text: prompt }] }],
+      generationConfig: { temperature: 0.3, maxOutputTokens: 900 }
+    };
+    const url = this.BASE + '/models/' + encodeURIComponent(this.model) + ':generateContent?key=' + encodeURIComponent(this.key);
+    const ctl = new AbortController();
+    const timer = setTimeout(()=>ctl.abort(), 45000);
+    try{
+      const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), signal:ctl.signal});
+      const j = await r.json().catch(()=>({}));
+      if(!r.ok) throw new Error(errText(r.status, j));
+      const cand = (j.candidates||[])[0];
+      const parts = (cand && cand.content && cand.content.parts) || [];
+      const txt = parts.map(p=>p.text||'').join('').trim();
+      if(!txt){
+        const br = (cand && cand.finishReason) || 'EMPTY';
+        throw new Error(br==='SAFETY' ? '模型拒答（內容審查），換個模型或改寫句子' : '模型沒回內容（'+br+'）');
+      }
+      return txt;
+    } finally { clearTimeout(timer); }
+  }
+};
+function hashStr(s){ let h=5381; for(let i=0;i<s.length;i++){ h=((h<<5)+h+s.charCodeAt(i))|0; } return (h>>>0).toString(36); }
+function errText(status, j){
+  const msg = (j && j.error && j.error.message) ? j.error.message : '';
+  if(status===400) return '請求被拒（多半是 key 不對或模型名無效）：'+(msg||'400');
+  if(status===403) return '這組 key 沒權限（可能未啟用 Gemini API）：'+(msg||'403');
+  if(status===429) return '額度用完（429）：換一組 key 或等隔天重置';
+  if(status>=500) return 'Google 伺服器出錯（'+status+'），等一下再試';
+  return '失敗 '+status+(msg?'：'+msg:'');
+}
+const AI_PROMPTS = {
+  explain: (en)=>`你是台灣的英文老師，對象是中文母語學習者。請用繁體中文分析下面這句英文，格式固定如下，不要客套話：\n1) 結構：標出主詞、動詞、主要子句／從屬子句\n2) 重點文法：1~2 點，講「為什麼這樣寫」\n3) 自然譯：一句話\n4) 提醒：最容易誤解的一點\n全篇 250 字以內。句子：\n${en}`,
+  chunk: (en)=>`你是英文口語教練。把下面這句英文依「意群／換氣點」切開，用 ｜ 分隔（不要改字、不要加字），然後換行寫一行中文提示說明每個意群在講什麼。格式：\n意群：A ｜ B ｜ C\n提示：- A 的意思；- B 的意思\n全篇 150 字以內。句子：\n${en}`,
+  words: (en)=>`從下面這句英文挑 2~4 個值得學的單字或片語，用繁體中文逐項列出：單字（詞性）＝中文意思；常見搭配；再造一個跟原句不同的例句（英文＋中文）。格式每項一行，不要客套話，全篇 220 字以內。句子：\n${en}`
+};
+async function runAI(card, it, kind, btn){
+  const out = card.querySelector('[data-role=aiout]');
+  const cached = GEMM.cached(kind, it.en);
+  out.classList.remove('hide'); out.classList.remove('busy');
+  if(cached){ out.innerHTML = aiShell(kind) + '\n' + esc(cached); bindAiClose(out); return; }
+  if(!GEMM.key){ out.innerHTML = aiShell(kind) + '\n請先到右上齒輪設定你的 Gemini API key（免費申請）。'; bindAiClose(out); return; }
+  if(!GEMM.model){ out.innerHTML = aiShell(kind) + '\n請到右上齒輪按「測試」選擇模型。'; bindAiClose(out); return; }
+  out.innerHTML = aiShell(kind) + '\n思考中…';
+  out.classList.add('busy');
+  btn.disabled = true;
+  try{
+    const txt = await GEMM.ask(AI_PROMPTS[kind](it.en));
+    GEMM.put(kind, it.en, txt);
+    out.classList.remove('busy');
+    out.innerHTML = aiShell(kind) + '\n' + esc(txt);
+  }catch(e){
+    out.classList.remove('busy');
+    const msg = e.message==='NO_KEY' ? '沒有 key' : e.message==='NO_MODEL' ? '沒有模型' : String(e.message||e);
+    out.innerHTML = aiShell(kind) + '\n⚠ ' + esc(msg);
+  }finally{
+    btn.disabled = false;
+    bindAiClose(out);
+  }
+}
+function aiShell(kind){
+  const label = kind==='explain' ? 'AI 句子解析' : kind==='chunk' ? 'AI 意群切分' : 'AI 單字講解';
+  return '<div class="hd"><span>' + label + '</span><button data-aiclose="1">×</button></div>';
+}
+function bindAiClose(out){
+  const b = out.querySelector('[data-aiclose]');
+  if(b) b.addEventListener('click', ()=> out.classList.add('hide'));
 }
 
 /* ---------- 語音 ---------- */
@@ -440,6 +574,12 @@ function renderSentences(){
         <button class="btn sm" data-act="togglezh">中</button>
         <button class="btn sm star${it.star?' on':''}" data-act="star">★</button>
       </div>
+      <div class="acts">
+        <button class="btn sm ai" data-act="ai-explain">🤖 解析</button>
+        <button class="btn sm ai" data-act="ai-chunk">✂ 意群</button>
+        <button class="btn sm ai" data-act="ai-words">📖 單字</button>
+      </div>
+      <div class="ai-out hide" data-role="aiout"></div>
       <textarea class="dict-in" rows="2" data-role="in" placeholder="聽到的內容打這裡…"></textarea>
       <div class="acts" data-role="dictacts" style="display:none">
         <button class="btn sm" data-act="check">對答案</button>
@@ -479,6 +619,9 @@ function bindSentenceEvents(){
           card.querySelector('[data-role=zh]').classList.remove('hide');
         }
         if(act==='again'){ setActive(card); await TTS.speak(it.en); }
+        if(act==='ai-explain'){ runAI(card, it, 'explain', btn); }
+        if(act==='ai-chunk'){ runAI(card, it, 'chunk', btn); }
+        if(act==='ai-words'){ runAI(card, it, 'words', btn); }
       });
     });
     // 點英文＝顯示/遮住
@@ -631,6 +774,15 @@ function bind(){
     $('#tl').value = CFG.tl;
     $('#autoBlur').value = String(CFG.autoBlur);
     fillVoiceSelect();
+    $('#gemKey').value = GEMM.key;
+    if(GEMM.model){
+      const sel=$('#gemModel');
+      if(!Array.from(sel.options).some(o=>o.value===GEMM.model)){
+        sel.innerHTML = `<option value="${esc(GEMM.model)}">${esc(GEMM.model)}</option>`;
+      }
+      sel.value = GEMM.model;
+    }
+    gemStatus(GEMM.key ? '已存一組 key（測試可確認能不能用）' : '');
     const list = loadHist();
     $('#storeInfo').textContent = `本機存了 ${list.length} / ${MAX_ARTICLES} 篇`;
     $('#sheet').classList.add('show');
@@ -645,6 +797,41 @@ function bind(){
   $('#voice').addEventListener('change', e=>{ CFG.voice = e.target.value; TTS.speak('This is how I sound.'); });
   $('#tl').addEventListener('change', e=>{ CFG.tl = e.target.value; });
   $('#autoBlur').addEventListener('change', e=>{ CFG.autoBlur = Number(e.target.value); });
+  // Gemini 設定
+  function gemStatus(txt, cls){ const el=$('#gemStatus'); el.textContent=txt||''; el.className = cls||''; }
+  $('#gemSave').addEventListener('click', ()=>{
+    const v = $('#gemKey').value.trim();
+    if(!v){ gemStatus('先貼上 key', 'err'); return; }
+    GEMM.key = v;
+    gemStatus('已存到本機（' + v.slice(0,6) + '…' + v.slice(-4) + '）', 'ok');
+    fillModelSelect(GEMM.key);
+  });
+  $('#gemClear').addEventListener('click', ()=>{
+    GEMM.key=''; $('#gemKey').value='';
+    gemStatus('已刪除本機 key', 'ok');
+  });
+  $('#gemTest').addEventListener('click', async ()=>{
+    const v = $('#gemKey').value.trim();
+    if(v) GEMM.key = v;
+    if(!GEMM.key){ gemStatus('先貼上 key', 'err'); return; }
+    gemStatus('測試中…');
+    try{
+      const list = await GEMM.listModels();
+      if(!list.length){ gemStatus('這組 key 沒有可用的 Gemini 模型', 'err'); return; }
+      const sel = $('#gemModel');
+      sel.innerHTML = list.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('');
+      if(GEMM.model && list.indexOf(GEMM.model)>=0) sel.value = GEMM.model;
+      else { sel.value = list[0]; GEMM.model = list[0]; }
+      gemStatus('連線成功，可用模型 ' + list.length + ' 個', 'ok');
+    }catch(e){
+      gemStatus(String(e.message||e), 'err');
+    }
+  });
+  $('#gemModel').addEventListener('change', e=>{ GEMM.model = e.target.value; });
+  $('#gemWarm').addEventListener('click', ()=>{
+    const n = GEMM.clearCache();
+    gemStatus('已清 ' + n + ' 筆 AI 快取', 'ok');
+  });
   $('#btnWipe').addEventListener('click', ()=>{
     if(!confirm('清空本機所有練習紀錄？')) return;
     LS.set('articles', []); CURRENT=null;
